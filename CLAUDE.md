@@ -4,93 +4,73 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a Lark (Feishu) MCP Server that provides Model Context Protocol integration for Feishu APIs. It consists of two main components:
+Lark (Feishu) MCP Server exposing Feishu APIs as Model Context Protocol tools over STDIO. Two crates:
 
-1. **larkrs-mcp** - The main MCP server binary that exposes Feishu functionality as MCP tools
-2. **larkrs-client** - A Rust client library for the Lark (Feishu) API
+1. **larkrs-mcp** (root, `src/main.rs`) — the MCP server binary
+2. **larkrs-client** (`larkrs-client/`) — standalone Feishu API client library, published to crates.io (path dependency, NOT a cargo workspace member; it has its own `Cargo.lock`)
+
+Rust edition 2024. Key deps: `poem-mcpserver` 0.1.8, `reqwest` 0.12, `tokio`, `serde`, `anyhow` + `thiserror`, `env_logger`.
 
 ## Common Commands
 
-### Building and Development
 ```bash
-# Build the entire project
-cargo build
-
-# Build for release
+cargo build                      # build server
 cargo build --release
-
-# Run tests
-cargo test
-
-# Run tests for the client library only
-cd larkrs-client && cargo test
-
-# Run the MCP server
-cargo run
+cargo run                        # run MCP server (STDIO)
+cargo check                      # fast compile check
+cargo test -p larkrs-client      # client tests (or: cd larkrs-client && cargo test)
+cargo clippy && cargo fmt        # no custom config; defaults apply
 ```
 
-### Testing Environment Setup
-Set up environment variables by copying `.env.example` to `.env` and filling in your Feishu credentials:
+### Environment
 ```bash
-cp .env.example .env
-# Edit .env with your FEISHU_APP_ID and FEISHU_APP_SECRET
+cp .env.example .env   # fill FEISHU_APP_ID and FEISHU_APP_SECRET
 ```
+`.env` is gitignored — never commit it.
 
 ## Architecture
 
 ### Project Structure
-- `src/main.rs` - MCP server entry point and tool definitions
-- `larkrs-client/` - Standalone Feishu API client library
-  - `src/auth.rs` - Token management with automatic refresh
-  - `src/bitable/` - Bitable (spreadsheet) operations
-  - `src/bot/` - Chat and messaging functionality
+- `src/main.rs` — `LarkServer` + all MCP tool definitions
+- `larkrs-client/src/lib.rs` — `LarkApiResponse<T>` envelope (`code`/`msg`/`data`, `is_success()` ⇔ `code == 0`)
+- `larkrs-client/src/auth.rs` — `FeishuTokenManager` (tenant access token, cached in `Arc<Mutex<>>`, 60s refresh buffer)
+- `larkrs-client/src/bitable/` — `mod.rs` = DTOs (records, filters, fields); `table.rs` = `BitableTableClient`
+- `larkrs-client/src/bot/` — `mod.rs` = DTOs (chat, text/post messages); `chat.rs` = `ChatClient`
+- `larkrs-client/src/wiki/` — `mod.rs` = DTOs; `client.rs` = `WikiClient` (+ URL parsing)
 
-### Key Components
+Module pattern: each domain has `mod.rs` for serde types and a sibling file for the `XxxClient` with `new()` + async methods.
 
-**MCP Server (`src/main.rs`)**
-- Uses `poem-mcpserver` framework with STDIO transport
-- Implements `#[Tools]` trait on `LarkServer` struct
-- Each public async method becomes an MCP tool
-- All tools return `Json<T>` wrapped responses
-
-**Authentication (`larkrs-client/src/auth.rs`)**
-- `FeishuTokenManager` handles tenant access token lifecycle
-- Automatic token refresh with configurable buffer time
-- Thread-safe token caching using Arc<Mutex<>>
-- Requires `FEISHU_APP_ID` and `FEISHU_APP_SECRET` environment variables
-
-**Bitable Operations (`larkrs-client/src/bitable/`)**
-- `BitableTableClient` for spreadsheet operations
-- Record CRUD operations with filtering and sorting
-- Field metadata retrieval with type information
-- Batch operations for efficiency
-
-**Bot Operations (`larkrs-client/src/bot/`)**
-- `ChatClient` for messaging functionality
-- Text and markdown message sending
-- Chat group listing and management
+### MCP Server (`src/main.rs`)
+- `poem-mcpserver` with STDIO transport; `#[Tools]` on `impl LarkServer`
+- Each async method = one MCP tool; **its doc comment is the tool description shown to the LLM** — keep Args/examples accurate
+- Tools return `Json<T>`
 
 ### MCP Tools Available
-
-1. `table_records_list` - Get records from Bitable tables
-2. `create_table_records_json` - Batch create records in Bitable
-3. `table_fields_info` - Get field metadata for tables
-4. `chat_group_list` - List available chat groups
-5. `send_text_message` - Send text messages to chats
-6. `send_markdown_message` - Send formatted markdown messages
+1. `table_records_list` — get records from a Bitable table
+2. `create_table_records_json` — batch create records (JSON string array)
+3. `table_fields_info` — field metadata incl. `write_type` hint
+4. `chat_group_list` — list chat groups the bot is in
+5. `send_text_message` — send text to a chat
+6. `send_markdown_message` — send `post` (rich text) message
+7. `read_wiki_content` — read raw text of a wiki doc from its URL
 
 ### Data Flow
-1. Environment variables loaded via `dotenvy`
-2. Token manager handles Feishu authentication
-3. Client modules use token manager for API calls
-4. MCP server exposes client functionality as tools
-5. All responses follow Lark API standard format with code/msg/data structure
+`dotenvy`/env → `FeishuTokenManager` → `XxxClient` builds request with Bearer token → `LarkApiResponse<T>` → MCP tool wraps in `Json`.
 
-### URL Format
-Feishu URLs follow this pattern: `https://xxx.feishu.cn/base/{app_token}?table={table_id}&view={view_id}`
-- Extract `app_token` and `table_id` from these URLs for API calls
+### URL Formats
+- Bitable: `https://xxx.feishu.cn/base/{app_token}?table={table_id}&view={view_id}`
+- Wiki: `https://xxx.feishu.cn/wiki/{node_token}?...`
 
 ### Error Handling
-- Custom error types in `auth.rs` with thiserror
-- API responses include success checking via `is_success()` method
-- Network and JSON parsing errors are properly wrapped and propagated
+- Client: `anyhow::Result` with `.context(...)`; domain errors via `thiserror` (`FeishuApiError`, `BitableApiError`)
+- Server: tools currently use `unwrap_or_default()` / log-and-default — failures surface to the MCP caller as empty results
+
+## Conventions & Gotchas (added by onboarding)
+
+- **Never write to stdout in the server** — STDIO is the MCP transport. Use `log` macros (env_logger targets stderr). `RUST_LOG=debug cargo run` for verbose logs.
+- **Token cache is per client instance**, and tools construct a new client per call, so every tool call re-fetches a tenant token. Share a client/token manager if adding high-frequency tools.
+- **Tests are live integration tests** against Feishu: they need real `.env` creds and real IDs (placeholders are `"xxx"`), so they fail offline. Pure-logic code (URL parsing, DTO conversions) should get offline unit tests.
+- `read_wiki_content` passes the wiki `node_token` directly to the docx `raw_content` API; this may not resolve for all wiki nodes (proper path: wiki get_node → `obj_token`).
+- New Feishu API: add DTOs in `<domain>/mod.rs`, method on the domain client, then a tool in `main.rs`; update the tool list above and README.
+- Bitable timestamps are milliseconds. Some docs/tool descriptions are in Chinese — keep that style when editing existing ones.
+- Commits: conventional commits with optional scope, e.g. `feat(wiki): ...`, `feat(bot): ...`, `chore: ...`. Work on `main`.
